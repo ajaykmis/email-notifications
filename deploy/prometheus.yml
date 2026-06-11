@@ -1,0 +1,27 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'api'
+    static_configs:
+      - targets: ['api:9091']
+
+  - job_name: 'worker-transactional'
+    static_configs:
+      - targets: ['worker-transactional:9091']
+
+  - job_name: 'worker-promotional'
+    static_configs:
+      - targets: ['worker-promotional:9091']
+
+  - job_name: 'webhook'
+    static_configs:
+      - targets: ['webhook:9091']
+
+  - job_name: 'analytics-worker'
+    static_configs:
+      - targets: ['analytics-worker:9091']
+
+  - job_name: 'redis-exporter'
+    static_configs:
+      - targets: ['redis-exporter:9121']
