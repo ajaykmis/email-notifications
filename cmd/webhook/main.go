@@ -12,8 +12,34 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 )
+
+// ── Prometheus metrics ───────────────────────────────────────────────────────
+
+var (
+	webhookTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "webhook_received_total",
+		Help: "Webhook events received from Resend",
+	}, []string{"event_type"})
+
+	webhookDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "webhook_process_duration_seconds",
+		Help:    "Time to process a webhook event",
+		Buckets: prometheus.DefBuckets,
+	})
+
+	webhookVerifyFailed = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "webhook_verification_failed_total",
+		Help: "Webhook signature verification failures",
+	})
+)
+
+func init() {
+	prometheus.MustRegister(webhookTotal, webhookDuration, webhookVerifyFailed)
+}
 
 // ── DB + Redis globals ──────────────────────────────────────────────────────
 
@@ -64,12 +90,18 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleResendWebhook(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	defer func() {
+		webhookDuration.Observe(time.Since(start).Seconds())
+	}()
+
 	// Simplified signature verification for MVP:
 	// If RESEND_WEBHOOK_SECRET is set, require svix-signature header presence.
 	webhookSecret := os.Getenv("RESEND_WEBHOOK_SECRET")
 	if webhookSecret != "" {
 		sig := r.Header.Get("svix-signature")
 		if sig == "" {
+			webhookVerifyFailed.Inc()
 			http.Error(w, "missing signature", http.StatusUnauthorized)
 			return
 		}
@@ -90,6 +122,8 @@ func handleResendWebhook(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+
+	webhookTotal.WithLabelValues(internalType).Inc()
 
 	ctx := r.Context()
 
@@ -215,6 +249,14 @@ func main() {
 	// Graceful shutdown on SIGINT/SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Prometheus metrics server
+	go func() {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", promhttp.Handler())
+		log.Println("Metrics server on :9091")
+		http.ListenAndServe(":9091", metricsMux)
+	}()
 
 	go func() {
 		log.Printf("Webhook service listening on %s", srv.Addr)

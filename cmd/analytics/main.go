@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -12,8 +13,35 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 )
+
+// ── Prometheus metrics ───────────────────────────────────────────────────────
+
+var (
+	analyticsProcessed = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "analytics_events_processed_total",
+		Help: "Total analytics events processed",
+	})
+
+	analyticsBatchSize = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "analytics_batch_size",
+		Help:    "Number of events per flush batch",
+		Buckets: []float64{1, 5, 10, 25, 50, 100},
+	})
+
+	analyticsFlushDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "analytics_rollup_duration_seconds",
+		Help:    "Time to flush a batch to campaign_metrics",
+		Buckets: prometheus.DefBuckets,
+	})
+)
+
+func init() {
+	prometheus.MustRegister(analyticsProcessed, analyticsBatchSize, analyticsFlushDuration)
+}
 
 var (
 	db  *sql.DB
@@ -89,6 +117,13 @@ func flush(ctx context.Context, events []AnalyticsEvent) {
 	if len(events) == 0 {
 		return
 	}
+
+	analyticsBatchSize.Observe(float64(len(events)))
+	analyticsProcessed.Add(float64(len(events)))
+	flushStart := time.Now()
+	defer func() {
+		analyticsFlushDuration.Observe(time.Since(flushStart).Seconds())
+	}()
 
 	// Group events by (campaign_id, bucket_hour).
 	groups := make(map[metricsKey]*metricsCounters)
@@ -268,6 +303,14 @@ func main() {
 
 	batch := newEventBatch()
 	flushCh := make(chan struct{}, 1)
+
+	// Prometheus metrics server
+	go func() {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", promhttp.Handler())
+		log.Println("Metrics server on :9091")
+		http.ListenAndServe(":9091", metricsMux)
+	}()
 
 	// Consumer goroutine: BRPOP loop that accumulates events.
 	go consumeLoop(ctx, batch, flushCh)

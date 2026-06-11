@@ -16,8 +16,34 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 )
+
+// ── Prometheus metrics ───────────────────────────────────────────────────────
+
+var (
+	workerSendTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "worker_email_send_total",
+		Help: "Emails processed by worker",
+	}, []string{"category", "status"}) // status: sent, failed, dry_run, unsubscribed
+
+	workerSendDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "worker_email_send_duration_seconds",
+		Help:    "Time to send email via Resend API",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"category"})
+
+	workerUnsubSkip = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "worker_unsubscribe_skip_total",
+		Help: "Emails skipped due to unsubscribe list",
+	})
+)
+
+func init() {
+	prometheus.MustRegister(workerSendTotal, workerSendDuration, workerUnsubSkip)
+}
 
 var (
 	db  *sql.DB
@@ -176,6 +202,8 @@ func processJob(ctx context.Context, resend *ResendClient, job EmailJob) {
 		// recipient is unsubscribed — skip send
 		markFailed(ctx, job.EmailID, "recipient unsubscribed")
 		logDeliveryEvent(ctx, job.EmailID, "FAILED", map[string]any{"reason": "unsubscribed"})
+		workerUnsubSkip.Inc()
+		workerSendTotal.WithLabelValues(job.Category, "unsubscribed").Inc()
 		log.Printf("[worker] skipped email_id=%s — recipient %s is unsubscribed",
 			job.EmailID, job.RecipientAddress)
 		return
@@ -183,11 +211,16 @@ func processJob(ctx context.Context, resend *ResendClient, job EmailJob) {
 
 	body := renderTemplate(job)
 
+	sendStart := time.Now()
 	resendID, err := resend.Send(job, body)
+	sendDuration := time.Since(sendStart).Seconds()
+	workerSendDuration.WithLabelValues(job.Category).Observe(sendDuration)
+
 	if err != nil {
 		log.Printf("[worker] resend error for %s: %v", job.EmailID, err)
 		markFailed(ctx, job.EmailID, err.Error())
 		logDeliveryEvent(ctx, job.EmailID, "FAILED", map[string]any{"error": err.Error()})
+		workerSendTotal.WithLabelValues(job.Category, "failed").Inc()
 		return
 	}
 
@@ -197,9 +230,11 @@ func processJob(ctx context.Context, resend *ResendClient, job EmailJob) {
 		"resend_id": resendID,
 	})
 	if resend.DryRun {
+		workerSendTotal.WithLabelValues(job.Category, "dry_run").Inc()
 		log.Printf("[worker] dry-run email_id=%s to=%s resend_id=%s",
 			job.EmailID, job.RecipientAddress, resendID)
 	} else {
+		workerSendTotal.WithLabelValues(job.Category, "sent").Inc()
 		log.Printf("[worker] sent email_id=%s to=%s resend_id=%s",
 			job.EmailID, job.RecipientAddress, resendID)
 	}
@@ -335,6 +370,14 @@ func main() {
 	// KEY NFR: transactional and promotional run on separate goroutines
 	// so promotional volume never blocks transactional delivery.
 	log.Println("Worker started — transactional + promotional consumers running")
+
+	// Prometheus metrics server
+	go func() {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", promhttp.Handler())
+		log.Println("Metrics server on :9091")
+		http.ListenAndServe(":9091", metricsMux)
+	}()
 
 	go processQueue(ctx, resend, queueTransactional) // high-priority
 	go processQueue(ctx, resend, queuePromotional)   // lower-priority, isolated
