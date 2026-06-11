@@ -1,385 +1,631 @@
-# Email Notification System
+# Email Marketing System -- Design Document
 
-Multi-tenant email delivery platform supporting transactional and promotional emails
-at 1B emails/day (10M users × 100 emails). Transactional emails must never be blocked
-by promotional volume. Delivery rate is tracked per email.
+Multi-tenant email marketing platform built on Resend for delivery. Supports
+transactional emails (login codes, order confirmations), promotional emails
+(marketing blasts), and file-based bulk campaigns with scheduling. Transactional
+emails are never blocked by promotional volume -- separate queues, separate
+workers, separate scaling.
 
----
+**Key properties:**
 
-## Email State Machine
-
-```
-PENDING → QUEUED → SENT
-                 → FAILED
-```
-
-- `PENDING` — created in DB; scheduled emails stay here until `scheduled_at <= NOW()`
-- `QUEUED` — pushed to Redis queue; worker has picked it up for delivery
-- `SENT` — SendGrid accepted the message
-- `FAILED` — SendGrid rejected, or max retries exhausted
-
----
-
-## Schema
-
-```sql
-tenants (
-  id UUID PK,
-  name TEXT UNIQUE        -- "booking-service", "marketing-service", ...
-)
-
-messages (
-  id UUID PK,
-  template_type TEXT,     -- LOGIN_MSG, WELCOME, PROMO_OFFER, ORDER_CONFIRM
-  locale TEXT,            -- "en", "fr", "es"
-  content TEXT,           -- raw template body
-  UNIQUE (template_type, locale)
-)
-
-emails (
-  id UUID PK,
-  tenant_id UUID FK,
-  recipient_user_id TEXT,
-  recipient_address TEXT,
-  category TEXT,          -- TRANSACTIONAL | PROMOTIONAL
-  template_type TEXT,
-  template_attributes JSONB,  -- {code: "123456", order_id: "ORD-001", ...}
-  locale TEXT,
-  status TEXT,            -- PENDING | QUEUED | SENT | FAILED
-  scheduled_at TIMESTAMPTZ,   -- NULL = send immediately
-  sent_at TIMESTAMPTZ,
-  failure_reason TEXT
-)
-
-delivery_events (
-  id UUID PK,
-  email_id UUID FK,
-  event_type TEXT,        -- QUEUED | SENT | DELIVERED | BOUNCED | FAILED
-  occurred_at TIMESTAMPTZ,
-  metadata JSONB
-)
-```
-
-Indexes: `(status)`, `(tenant_id)`, `(scheduled_at) WHERE scheduled_at IS NOT NULL`
-
----
-
-## API
-
-| Endpoint | Purpose |
-|---|---|
-| `POST /send-email` | Validate, persist, enqueue immediately |
-| `POST /schedule-email` | Validate, persist with `scheduled_at`; sweeper enqueues later |
-| `GET /delivery-stats` | Count by `(category, status)`, filterable by `tenant_id` |
-
-**`POST /send-email` request:**
-```json
-{
-  "tenant_id": "uuid",
-  "user_id": "user-42",
-  "category": "TRANSACTIONAL",
-  "template_type": "LOGIN_MSG",
-  "template_attributes": { "code": "987654" },
-  "locale": "en"
-}
-```
-
-**Validation:**
-- `category` must be `TRANSACTIONAL` or `PROMOTIONAL`
-- `template_type` must be a known template
-- `user_id` must resolve via Users service (`userExists()`)
-- `tenant_id` must exist
-
----
-
-## Request Flow
-
-```
-Client (booking / marketing / friending svc)
-        │
-        │ POST /send-email
-        ▼
-  ┌─────────────────┐
-  │  Load Balancer  │
-  └────────┬────────┘
-           │
-           ▼
-  ┌─────────────────────────────────────────────┐
-  │          Email Ingestion Service             │
-  │                                             │
-  │  1. Validate request (category, template)   │
-  │  2. userExists() → Users Service            │
-  │  3. INSERT emails (status=PENDING)           │
-  │  4. LPUSH → queue:{transactional|promo}     │
-  │  5. UPDATE emails (status=QUEUED)            │
-  │  6. INSERT delivery_events (QUEUED)          │
-  │                                             │
-  │  Returns: { email_id, status: "QUEUED" }    │
-  └─────────────────────────────────────────────┘
-           │
-           │ Redis LPUSH
-           ▼
-  ┌─────────────────────────────────────────────┐
-  │              Redis Queues                   │
-  │                                             │
-  │   queue:transactional  (high priority)      │
-  │   queue:promotional    (isolated)           │
-  └───────┬─────────────────────┬───────────────┘
-          │                     │
-          ▼                     ▼
-  ┌───────────────┐   ┌───────────────────────┐
-  │  Worker       │   │  Worker (×2 replicas) │
-  │  Transact.    │   │  Promotional          │
-  └───────┬───────┘   └──────────┬────────────┘
-          │                      │
-          └──────────┬───────────┘
-                     │ BRPOP
-                     ▼
-           renderTemplate(job)
-                     │
-                     ▼
-             SendGrid API
-                     │
-          ┌──────────┴──────────┐
-          │ success             │ failure
-          ▼                     ▼
-   UPDATE status=SENT    UPDATE status=FAILED
-   INSERT delivery_event  INSERT delivery_event
-   (SENT)                 (FAILED, reason)
-```
-
----
-
-## Worker Design
-
-```
-BRPOP from queue (2s timeout — allows clean shutdown)
-  → renderTemplate(job)       -- substitute TemplateAttributes into template body
-  → SendGrid.Send(job, body)  -- POST to api.sendgrid.com/v3/mail/send
-  → on success: UPDATE emails SET status=SENT, sent_at=NOW()
-               INSERT delivery_events(SENT)
-  → on failure: UPDATE emails SET status=FAILED, failure_reason=...
-               INSERT delivery_events(FAILED)
-```
-
-**Key isolation property:** transactional and promotional workers are separate goroutines
-consuming separate Redis keys. A promotional burst (10M marketing emails) cannot cause
-head-of-line blocking for a transactional `LOGIN_MSG`. Workers are also separate
-Docker containers — promotional replicas scale independently of transactional.
-
-**Template rendering:** `(template_type, locale)` → fetch body from `messages` table,
-substitute `template_attributes` with `text/template`. Prototype uses an in-process switch.
-
----
-
-## Scheduled Email Flow
-
-```
-POST /schedule-email
-  → INSERT emails (status=PENDING, scheduled_at=T)
-  → Returns immediately — no queue push yet
-
-Every 30s — Scheduler goroutine (inside worker):
-  SELECT * FROM emails
-  WHERE status='PENDING' AND scheduled_at <= NOW()
-  → UPDATE status=QUEUED
-  → LPUSH queue:{category}
-  → INSERT delivery_events(QUEUED)
-```
-
-The scheduler is an UPDATE...RETURNING — atomic read-modify, no race between
-multiple worker instances. Only rows that transition from PENDING→QUEUED get pushed.
+- 6 services: API, Worker (transactional), Worker (promotional), Campaign Worker, Webhook Service, Analytics Worker
+- PostgreSQL for durable state, Redis for job queues
+- GKE deployment with HPA autoscaling on queue depth
+- Dry-run mode for load testing without email costs or Resend API calls
 
 ---
 
 ## Architecture
 
 ```
-  Tenants (booking / marketing / friending)
-        │
-        │ POST /send-email   POST /schedule-email
-        ▼
-  ┌─────────────┐
-  │Load Balancer│
-  └──────┬──────┘
-         │
-         ▼
-  ┌───────────────────┐   userExists()    ┌─────────────────┐
-  │ Email Ingestion   │ ─────────────────►│  Users Service  │
-  │     Service       │                   └─────────────────┘
-  │   (stateless)     │   INSERT/UPDATE   ┌─────────────────┐
-  │                   │ ─────────────────►│   PostgreSQL     │
-  └────────┬──────────┘                   │  (primary DB)   │
-           │                              │  emails         │
-           │ LPUSH                        │  messages       │
-           ▼                              │  delivery_events│
-  ┌────────────────────────┐              └────────┬────────┘
-  │       Redis            │                       ▲
-  │                        │                       │ UPDATE status
-  │  queue:transactional ──┼──► Worker (×1)        │ INSERT events
-  │  queue:promotional   ──┼──► Worker (×2) ───────┘
-  └────────────────────────┘         │
-                                     │
-                              ┌──────▼──────┐
-                              │   SendGrid  │
-                              └─────────────┘
+                                POST /send-email
+                                POST /schedule-email
+                                POST /campaigns
+  Tenants ──────────────────────────────────►  API Service (:8080)
+  (booking, marketing, friending)                  │
+                                                   │ INSERT emails/campaigns
+                                                   │ LPUSH
+                                                   ▼
+                                          ┌────────────────────────────┐
+                                          │         Redis              │
+                                          │                            │
+                                          │  queue:transactional ──────┼──► Worker (transactional)
+                                          │  queue:promotional   ──────┼──► Worker (promotional, x2)
+                                          │  queue:campaigns     ──────┼──► Campaign Worker
+                                          │  queue:analytics     ──────┼──► Analytics Worker
+                                          └────────────────────────────┘
+                                                                              │
+                                               ┌──────────────────────────────┘
+                                               │
+                                               ▼
+                                          Resend API
+                                          (https://api.resend.com/emails)
+                                               │
+                                               │ webhook callbacks
+                                               ▼
+                                          Webhook Service (:8080)
+                                               │
+                                               ├── INSERT delivery_events
+                                               ├── INSERT unsubscribes (on unsub)
+                                               └── LPUSH queue:analytics
+                                                          │
+                                                          ▼
+                                                   Analytics Worker
+                                                          │
+                                                          ▼
+                                                   UPSERT campaign_metrics
+                                                   (hourly buckets)
+```
+
+**Data flow summary:**
+
+```
+Client → API → Redis Queues → Workers → Resend API
+                                 ↑
+Resend Webhooks → Webhook Service → delivery_events + queue:analytics
+                                                       ↓
+                                                 Analytics Worker → campaign_metrics
 ```
 
 ---
 
-## Scale
+### Services
 
-| Layer | Approach |
-|---|---|
-| API servers | Stateless, horizontal — scale on CPU/RPS |
-| Transactional workers | Dedicated pool — never share with promotional |
-| Promotional workers | Scale on `LLEN queue:promotional`; k8s HPA or KEDA |
-| Redis queues | Two queues enforce priority isolation; Redis Cluster for throughput |
-| PostgreSQL | Read replicas for `delivery-stats`; primary for writes |
-| SendGrid | Rate-limit per API key; shard across multiple keys if needed |
+| Service | Binary | Role | Port | Scaling Strategy |
+|---------|--------|------|------|------------------|
+| API | `cmd/api` | HTTP ingestion -- validate, persist, enqueue | 8080 | HPA on CPU/RPS |
+| Worker (transactional) | `cmd/worker` | BRPOP `queue:transactional`, send via Resend | -- | Fixed 1 replica (low latency) |
+| Worker (promotional) | `cmd/worker` | BRPOP `queue:promotional`, send via Resend | -- | HPA on `LLEN queue:promotional` |
+| Campaign Worker | `cmd/campaign` | BRPOP `queue:campaigns`, fan-out file to `queue:promotional` | -- | HPA on `LLEN queue:campaigns` |
+| Webhook Service | `cmd/webhook` | Receives Resend webhook events, writes delivery_events | 8080 | HPA on CPU |
+| Analytics Worker | `cmd/analytics` | BRPOP `queue:analytics`, batch-upsert campaign_metrics | -- | HPA on `LLEN queue:analytics` |
 
-**1B emails/day math:**
-- 1B / 86400s ≈ 11,600 emails/sec peak
-- 10× burst headroom → ~115,000/sec
-- At 50ms/email per worker goroutine → 50 goroutines per worker pod → ~20 worker pods
-- Redis easily handles 100K+ ops/sec — not a bottleneck
-
----
-
-## Staff-Level Follow-ups
-
-### Correctness & Edge Cases
-
-**What if userExists() is down?**
-Fail fast — return 503. Do not enqueue without a valid recipient address. Alternatively,
-accept the request, store `recipient_user_id` without resolving, and resolve lazily in the worker
-before sending (trades strict validation for higher ingestion availability).
-
-**Duplicate sends on worker crash?**
-Worker crashes after SendGrid accepts but before updating DB → email is re-queued
-by a timeout reaper and sent again. Fix: store SendGrid's `X-Message-Id` in the emails
-row before calling Send, check for it on retry. Or use SendGrid's `x-unique-args` for
-server-side deduplication by `email_id`.
-
-**Promotional email to unsubscribed user?**
-Validate against a suppression list before enqueuing (not after). Failing to do so wastes
-worker cycles and risks sending to opted-out users. Check `suppressions` table or call
-a dedicated Preferences service in the ingestion layer.
-
-**Scheduled email and user deletes their account between creation and delivery?**
-Worker calls userExists() again at send time, not just at ingestion. If user no longer
-exists, mark email FAILED with `reason=USER_DELETED` rather than sending to a stale address.
+The Worker binary (`cmd/worker`) is deployed twice -- once for transactional and
+once for promotional -- consuming different Redis queues. Same binary, different
+queue assignment via the BRPOP keys. Both are started as goroutines within the
+same process for local development; in production they are separate Deployments.
 
 ---
 
-### Scale & Performance
+### Queue Topology
 
-**Separate queues are not enough at massive promotional scale.**
-At 800M promotional emails/day, even with isolated workers, a single Redis key becomes
-a hot write. Solution: fan out to `queue:promotional:{shard_0..N}`. Workers round-robin
-across shards. Kafka is a better fit at this scale — topics partition naturally.
+| Queue | Producer | Consumer | Purpose |
+|-------|----------|----------|---------|
+| `queue:transactional` | API (on `POST /send-email` with `category=TRANSACTIONAL`), Scheduler sweep | Worker (transactional) | High-priority email delivery -- login codes, order confirmations |
+| `queue:promotional` | API (on `POST /send-email` with `category=PROMOTIONAL`), Campaign Worker fan-out | Worker (promotional) | Bulk/marketing email delivery, isolated from transactional |
+| `queue:campaigns` | API (on `POST /campaigns`), Campaign Sweeper | Campaign Worker | Triggers file-streaming fan-out for bulk campaigns |
+| `queue:analytics` | Webhook Service (on every Resend callback) | Analytics Worker | Batched metrics aggregation into `campaign_metrics` |
 
-**Template rendering is synchronous and per-email.**
-At 11K emails/sec, rendering the same `LOGIN_MSG` template thousands of times/sec is
-wasteful. Cache rendered templates by `(template_type, locale, hash(attributes))` in
-Redis. Invalidate on template update. Reduces DB reads for the `messages` table to near zero.
-
-**Delivery-stats query is a full table scan.**
-`GROUP BY category, status` without a time bound scans all emails. Add `created_at`
-index and require callers to supply a time window. For high-frequency dashboards, maintain
-a materialized counters table updated by triggers or a separate aggregation process.
-
-**Localization lookup on every send.**
-Worker currently embeds templates in code. Production version should fetch from `messages`
-table by `(template_type, locale)` with Redis caching. Missing locale falls back to `en`
-before failing — never drop a transactional email because `fr` isn't translated yet.
+All queues use Redis lists with LPUSH (producer) / BRPOP (consumer). BRPOP uses
+a 2-second timeout so workers can check for context cancellation and shut down
+cleanly on SIGINT/SIGTERM.
 
 ---
 
-### Operational & Failure Modes
+## Data Schema
 
-**SendGrid rate limit hit.**
-SendGrid returns 429. Worker should implement exponential backoff (1s, 2s, 4s)
-and re-push to the back of the queue on exhaustion rather than marking FAILED.
-Maintain a per-API-key token bucket at the worker level to avoid even sending requests
-that will be rejected.
+### Tables
 
-**Redis goes down.**
-Ingestion service cannot enqueue — return 503. In-flight BRPOP calls fail — workers idle
-until Redis recovers. No emails are lost (emails table has PENDING/QUEUED records).
-On recovery, a reconciliation job can re-enqueue all QUEUED emails that have no `sent_at`.
+**tenants** -- Multi-tenant isolation. Each email and campaign belongs to a tenant.
 
-**How to track actual delivery (not just SENT)?**
-SENT = SendGrid accepted. DELIVERED = recipient mail server confirmed.
-Implement a SendGrid webhook handler (`POST /sendgrid/webhook`) that receives
-`delivered`, `bounce`, `open`, `click` events and writes them to `delivery_events`.
-This gives true delivery rate vs. acceptance rate.
+```sql
+tenants (
+  id         UUID PK DEFAULT gen_random_uuid(),
+  name       TEXT UNIQUE NOT NULL,       -- "booking-service", "marketing-service"
+  created_at TIMESTAMPTZ DEFAULT NOW()
+)
+```
 
-**Dead-letter handling.**
-Emails that fail after N retries should move to a dead-letter queue (separate Redis key
-or DB table). Expose `GET /emails/{id}/retry` to allow ops to manually replay specific
-emails after the underlying issue (bad template, invalid address) is fixed.
+**messages** -- Reusable template content keyed by (template_type, locale).
+
+```sql
+messages (
+  id             UUID PK DEFAULT gen_random_uuid(),
+  template_type  TEXT NOT NULL,       -- LOGIN_MSG, WELCOME, PROMO_OFFER, ORDER_CONFIRM
+  locale         TEXT DEFAULT 'en',
+  content        TEXT NOT NULL,
+  created_at     TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (template_type, locale)
+)
+```
+
+**emails** -- Every email job, whether transactional or part of a campaign.
+
+```sql
+emails (
+  id                  UUID PK DEFAULT gen_random_uuid(),
+  tenant_id           UUID FK → tenants(id),
+  recipient_user_id   TEXT NOT NULL,
+  recipient_address   TEXT NOT NULL,
+  category            TEXT CHECK (IN 'TRANSACTIONAL','PROMOTIONAL'),
+  template_type       TEXT NOT NULL,
+  template_attributes JSONB DEFAULT '{}',
+  locale              TEXT DEFAULT 'en',
+  status              TEXT CHECK (IN 'PENDING','QUEUED','SENT','FAILED'),
+  scheduled_at        TIMESTAMPTZ,         -- NULL = send immediately
+  sent_at             TIMESTAMPTZ,
+  failure_reason      TEXT,
+  campaign_id         UUID FK → campaigns(id),  -- NULL for non-campaign emails
+  resend_id           TEXT,                      -- Resend's message ID after send
+  created_at          TIMESTAMPTZ DEFAULT NOW()
+)
+-- Indexes: (status), (tenant_id), (scheduled_at WHERE NOT NULL), (campaign_id WHERE NOT NULL), (resend_id)
+```
+
+**delivery_events** -- Append-only event log for every state transition.
+
+```sql
+delivery_events (
+  id          UUID PK DEFAULT gen_random_uuid(),
+  email_id    UUID FK → emails(id),
+  event_type  TEXT NOT NULL,    -- QUEUED, SENT, DELIVERED, OPENED, CLICKED, BOUNCED, FAILED, UNSUBSCRIBED
+  occurred_at TIMESTAMPTZ DEFAULT NOW(),
+  metadata    JSONB DEFAULT '{}'
+)
+```
+
+**campaigns** -- Bulk promotional sends driven by a file of user IDs.
+
+```sql
+campaigns (
+  id                  UUID PK DEFAULT gen_random_uuid(),
+  tenant_id           UUID FK → tenants(id),
+  template_type       TEXT NOT NULL,
+  template_attributes JSONB DEFAULT '{}',
+  locale              TEXT DEFAULT 'en',
+  status              TEXT CHECK (IN 'PENDING','RUNNING','DONE','FAILED'),
+  total_recipients    INT DEFAULT 0,
+  queued_count        INT DEFAULT 0,
+  sent_count          INT DEFAULT 0,
+  failed_count        INT DEFAULT 0,
+  file_path           TEXT DEFAULT '',    -- /uploads/campaign-xxx.txt or S3 key
+  scheduled_at        TIMESTAMPTZ,        -- NULL = run immediately
+  completed_at        TIMESTAMPTZ,
+  created_at          TIMESTAMPTZ DEFAULT NOW()
+)
+-- Indexes: (tenant_id), (scheduled_at WHERE NOT NULL)
+```
+
+**campaign_metrics** -- Time-bucketed aggregates per campaign, updated by the Analytics Worker.
+
+```sql
+campaign_metrics (
+  campaign_id  UUID FK → campaigns(id),
+  bucket       TIMESTAMPTZ,              -- truncated to hour
+  sent         INT DEFAULT 0,
+  delivered    INT DEFAULT 0,
+  opened       INT DEFAULT 0,
+  clicked      INT DEFAULT 0,
+  bounced      INT DEFAULT 0,
+  unsubscribed INT DEFAULT 0,
+  failed       INT DEFAULT 0,
+  PRIMARY KEY (campaign_id, bucket)
+)
+-- Index: (bucket)
+```
+
+**unsubscribes** -- Global per-tenant suppression list. Checked before every send.
+
+```sql
+unsubscribes (
+  id         UUID PK DEFAULT gen_random_uuid(),
+  email      TEXT NOT NULL,
+  tenant_id  UUID FK → tenants(id),
+  reason     TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (email, tenant_id)
+)
+-- Index: (email)
+```
 
 ---
 
-### Design Tradeoffs
+### Email State Machine
 
-**Redis vs Kafka for the job queue?**
-Redis: simpler ops, sub-millisecond BRPOP, adequate for 100K ops/sec.
-Kafka: ordered delivery per partition, infinite replay, consumer group semantics, built-in
-offset tracking. At 1B emails/day Kafka is worth it — you get per-tenant partitioning,
-the ability to replay failed promotional batches, and separation of fast transactional
-consumers from slow promotional ones with consumer groups rather than separate topics.
+```
+PENDING ──► QUEUED ──► SENT ──► DELIVERED
+                  ╲               ╱  ╲
+                   ╲             ╱    ╲
+                    ► FAILED    ► OPENED ──► CLICKED
+                                ╲
+                                 ► BOUNCED
+```
 
-**Two queues vs priority queue within one queue?**
-Redis has no native priority queue. Two separate keys + separate worker pools is simpler,
-more debuggable, and gives hard isolation. A min-heap priority queue (Redis Sorted Set
-with score = priority × timestamp) is an alternative but workers still compete on
-the same CPU — a promotional burst still impacts transactional latency.
+- `PENDING` -- created in DB; scheduled emails stay here until `scheduled_at <= NOW()`
+- `QUEUED` -- pushed to Redis queue; worker has picked it up
+- `SENT` -- Resend accepted the message (stored `resend_id`)
+- `FAILED` -- Resend rejected, recipient unsubscribed, or max retries exhausted
+- `DELIVERED` / `OPENED` / `CLICKED` / `BOUNCED` -- set by Resend webhooks via the Webhook Service
 
-**Synchronous userExists() call at ingestion vs. async resolution at send time?**
-Synchronous (current): fail fast, user gets immediate 404, no wasted queue slot.
-Async: higher ingestion throughput, but emails can reach the worker after user deletion.
-Use synchronous for transactional (latency-sensitive, correctness matters), async for
-promotional (bulk send where some attrition is acceptable).
+State transitions `PENDING → QUEUED → SENT` are managed by the API + Worker.
+Transitions after `SENT` are driven by Resend webhook callbacks.
 
-**Scheduled emails: DB polling vs. delayed queue (Redis ZSET)?**
-Polling (current): simple, 30s granularity, handles restarts cleanly.
-Redis ZSET with score=scheduled_at + ZRANGEBYSCORE: sub-second granularity,
-no DB reads at sweep time. Trade-off: ZSET is in-memory only — scheduled emails
-survive a Redis restart only if you also write to DB (as we do), so the ZSET is just
-an optimization not the source of truth.
+### Campaign State Machine
+
+```
+PENDING ──► RUNNING ──► DONE
+                 ╲
+                  ► FAILED
+```
+
+- `PENDING` -- campaign created; scheduled campaigns wait for sweeper
+- `RUNNING` -- fan-out in progress; Campaign Worker is streaming the file
+- `DONE` -- all recipients queued; `completed_at` set
+- `FAILED` -- file not found, DB error, or context cancelled
 
 ---
 
-### Cross-System Thinking
+## API Endpoints
 
-**How does this interact with the Users service at scale?**
-`userExists()` is a synchronous RPC on every ingest. At 11K emails/sec that's 11K
-RPC calls/sec to the Users service. Cache positive results in an in-process LRU
-(TTL=60s) keyed by `user_id`. For promotional sends where `user_id` lists are known
-at job-creation time, validate the entire batch up front via a bulk `usersExist([]id)`
-endpoint instead of per-email point lookups.
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/send-email` | Validate, persist email, enqueue immediately |
+| `POST` | `/schedule-email` | Validate, persist with `scheduled_at`; sweeper enqueues later |
+| `GET` | `/delivery-stats` | Count by `(category, status)`, filterable by `?tenant_id=` |
+| `POST` | `/campaigns` | Create campaign from file; enqueue or schedule |
+| `GET` | `/campaigns/{id}` | Poll campaign progress (queued/sent/failed counts, delivery rate) |
 
-**Multi-region deployment.**
-Transactional emails need low latency → ingest in the user's home region, send from
-the same region's workers. Promotional emails are bulk/async → one global queue is fine,
-workers can be in the cheapest region. Use a geolocation header or tenant config to
-route `POST /send-email` to the nearest ingestion shard.
+**`POST /send-email` request:**
+```json
+{
+  "tenant_id": "00000000-0000-0000-0000-000000000001",
+  "user_id": "user-42",
+  "category": "TRANSACTIONAL",
+  "template_type": "LOGIN_MSG",
+  "template_attributes": {"code": "987654"},
+  "locale": "en"
+}
+```
 
-**Compliance — GDPR right-to-erasure.**
-When a user requests deletion, the `delivery_events` and `emails` tables contain their
-address. Options: (1) hard delete rows — loses delivery history. (2) replace address with
-a hash or NULL — preserves aggregate delivery stats. (3) store address only in encrypted
-form with a per-user key — delete the key on erasure. Option 3 is ideal but operationally
-complex. At minimum, `recipient_address` and `recipient_user_id` should be in a separate
-table that can be wiped without touching the event log.
+**`POST /campaigns` request:**
+```json
+{
+  "tenant_id": "00000000-0000-0000-0000-000000000002",
+  "template_type": "PROMO_OFFER",
+  "template_attributes": {"offer": "Weekend sale: 40% off"},
+  "locale": "en",
+  "file_path": "/uploads/campaign-123.txt",
+  "scheduled_at": "2026-06-12T09:00:00Z"
+}
+```
 
-**Where does the system break at 10× scale (10B emails/day)?**
-1. PostgreSQL `emails` table at 10B rows/day → terabyte-scale fast. Partition by
-   `created_at` (monthly partitions), archive to S3 via pg_partman.
-2. Single Redis instance → Redis Cluster with 16 shards.
-3. SendGrid API limit → multi-provider (SendGrid + SES + Mailgun) with a provider
-   abstraction layer; route by category (transactional → SendGrid, promotional → SES for cost).
-4. `delivery_events` at 3 events/email = 30B rows/day → move to a columnar store
-   (ClickHouse, BigQuery) for analytics; keep only last 7 days in PostgreSQL.
+---
+
+## Resend Integration
+
+### ResendClient
+
+The `ResendClient` struct in `cmd/worker/main.go` wraps the Resend HTTP API:
+
+- **Send(job, body)** -- POST to `https://api.resend.com/emails` with Bearer auth
+- Returns Resend's message ID, stored as `resend_id` on the email row
+- Uses a 10-second HTTP client timeout
+
+### Dry-Run Mode
+
+When `--dry-run` flag or `DRY_RUN=true` env var is set:
+
+- `Send()` returns `"dry-run-{email_id}"` immediately -- no HTTP call to Resend
+- Email is still marked SENT in the database with a synthetic `resend_id`
+- All queue processing, DB writes, and metrics work identically
+- Enables full load testing of the pipeline without email costs or rate limits
+
+### Webhook Verification
+
+The Webhook Service at `POST /webhooks/resend` handles Resend callbacks:
+
+- If `RESEND_WEBHOOK_SECRET` is set, requires `svix-signature` header presence
+- Full Svix HMAC verification is stubbed for MVP (header presence check only)
+- Unknown event types are acknowledged (200 OK) to prevent Resend retries
+
+### Supported Webhook Events
+
+| Resend Event | Internal Type | Action |
+|---|---|---|
+| `email.delivered` | `DELIVERED` | Insert delivery_event, push to queue:analytics |
+| `email.opened` | `OPENED` | Insert delivery_event, push to queue:analytics |
+| `email.clicked` | `CLICKED` | Insert delivery_event, push to queue:analytics |
+| `email.bounced` | `BOUNCED` | Insert delivery_event, push to queue:analytics |
+| `email.unsubscribed` | `UNSUBSCRIBED` | Insert delivery_event, push to queue:analytics, insert into unsubscribes table |
+
+The webhook handler looks up the internal `email_id` by `resend_id`, so emails
+must have been sent (and `resend_id` stored) before webhooks can be processed.
+
+---
+
+## Campaign Fan-Out
+
+The Campaign Worker streams a newline-delimited file of user IDs and fans out
+individual `EmailJob` records to `queue:promotional` in batches of 1,000.
+
+**Flow:**
+
+1. Marketing service uploads `/uploads/campaign-123.txt` (one user_id per line)
+2. `POST /campaigns` with `file_path` creates a campaign record, pushes to `queue:campaigns`
+3. Campaign Worker BRPOPs, opens the file, scans line-by-line
+4. Every 1,000 lines: batch INSERT 1,000 email rows + LPUSH 1,000 jobs to `queue:promotional`
+5. Counters (`total_recipients`, `queued_count`, `failed_count`) updated atomically per batch
+6. On completion: `status=DONE`, `completed_at=NOW()`
+
+**Memory profile:** Peak memory is one 1,000-line batch in RAM, never the full file.
+A 1M-user campaign uses ~1MB of memory, not ~100MB.
+
+**Scheduling:** Campaigns with `scheduled_at` stay `PENDING`. A sweeper goroutine
+(30-second interval) runs `UPDATE ... RETURNING` to atomically claim due campaigns
+and push them to `queue:campaigns`. Double-dispatch is prevented by the
+`PENDING → RUNNING` status transition being atomic.
+
+**Sent-count sync:** A separate goroutine polls every 10 seconds, updating
+`sent_count` and `failed_count` on running campaigns from actual email statuses.
+
+---
+
+## Analytics Worker
+
+The Analytics Worker consumes `queue:analytics` and batch-upserts into
+`campaign_metrics` using time-bucketed (hourly) counters.
+
+**Batching strategy:**
+
+- Accumulates up to 100 events or waits 5 seconds (whichever comes first)
+- Groups events by `(campaign_id, bucket_hour)`
+- Uses `INSERT ... ON CONFLICT DO UPDATE SET col = col + EXCLUDED.col` for idempotent counter increments
+- Non-campaign events (individual transactional sends) are skipped
+
+**Graceful shutdown:** On SIGINT/SIGTERM, drains any remaining events in the
+batch before exiting.
+
+---
+
+## Autoscaler (GKE HPA)
+
+| Deployment | Metric | Min Replicas | Max Replicas | Target Value |
+|---|---|---|---|---|
+| api | CPU utilization | 2 | 10 | 70% |
+| worker-transactional | `LLEN queue:transactional` | 1 | 5 | 100 |
+| worker-promotional | `LLEN queue:promotional` | 1 | 20 | 500 |
+| worker-campaign | `LLEN queue:campaigns` | 1 | 3 | 1 |
+| webhook | CPU utilization | 2 | 10 | 70% |
+| analytics | `LLEN queue:analytics` | 1 | 5 | 200 |
+
+**Custom metrics pipeline:**
+
+```
+Redis LLEN → redis-exporter → Prometheus → prometheus-adapter → HPA
+```
+
+- `redis-exporter` scrapes Redis and exposes queue lengths as Prometheus metrics
+- `prometheus-adapter` translates Prometheus metrics into the Kubernetes custom metrics API
+- HPA queries `custom.metrics.k8s.io` and scales Deployments based on queue depth
+
+---
+
+## Failure Modes
+
+| Component | Failure Mode | When It Breaks | Impact | Mitigation |
+|---|---|---|---|---|
+| Redis | Memory exhaustion | Queue depth > available RAM | All enqueues fail, API returns 500 | Monitor `used_memory` + HPA to drain queues faster |
+| PostgreSQL | Connection exhaustion | > 100 concurrent connections | All DB operations fail | PgBouncer + connection pooling (`sql.SetMaxOpenConns`) |
+| PostgreSQL | `delivery_events` bloat | > 100M rows (no partitioning) | Query slowdown on event lookups | Partition by month, archive to cold storage |
+| Worker | Resend rate limit | Free tier: 100 emails/day | 429 errors, emails marked FAILED | Exponential backoff + token bucket rate limiter |
+| Campaign Worker | Large file (>10M lines) | Fan-out takes hours | Campaign stuck in RUNNING | Shard files across multiple campaign jobs |
+| Webhook Service | Burst after recovery | Resend retries queued webhooks | CPU spike, potential OOM | HPA on CPU + buffering via queue:analytics |
+| Analytics Worker | Crash mid-batch | Loses up to 100 events | Dashboard metrics drift | Backfill from delivery_events table |
+| HPA | Scale-up lag | Sudden burst (e.g., campaign fan-out) | ~30s of queue growth before new pods ready | Pre-scale with `minReplicas` + pod warm-up |
+| Network | Resend API timeout | API unreachable or slow | Emails stuck in QUEUED | 10s context timeout + retry with backoff |
+| Resend Webhooks | Out-of-order delivery | No ordering guarantee from Resend | Event ordering wrong (e.g., OPENED before DELIVERED) | Idempotent counters in campaign_metrics (additive, not state-dependent) |
+
+---
+
+## Observability
+
+### Prometheus Metrics
+
+**API Service:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `email_enqueue_total` | Counter | `category`, `tenant_id` | Emails enqueued |
+| `campaign_created_total` | Counter | `tenant_id` | Campaigns created |
+| `api_request_duration_seconds` | Histogram | `endpoint`, `status` | Request latency |
+
+**Worker:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `email_send_total` | Counter | `category`, `status` | Emails sent (success/fail) |
+| `email_send_duration_seconds` | Histogram | `category` | Resend API call latency |
+| `email_queue_depth` | Gauge | `queue` | Current LLEN of each queue |
+
+**Webhook Service:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `webhook_received_total` | Counter | `event_type` | Webhooks received by type |
+| `webhook_processing_errors_total` | Counter | `error_type` | DB/Redis errors during processing |
+
+**Analytics Worker:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `analytics_events_processed_total` | Counter | `event_type` | Events flushed to campaign_metrics |
+| `analytics_batch_size` | Histogram | -- | Events per flush batch |
+| `analytics_flush_duration_seconds` | Histogram | -- | Time to flush a batch |
+
+### Grafana Dashboards
+
+**1. Campaign Performance**
+
+- Open rate: `opened / delivered * 100` per campaign
+- Click rate: `clicked / delivered * 100` per campaign
+- Bounce rate: `bounced / sent * 100` per campaign
+- Delivery funnel: sent -> delivered -> opened -> clicked (stacked bar)
+- Unsubscribe rate over time (hourly buckets from `campaign_metrics`)
+
+**2. System Health**
+
+- Queue depths: `LLEN` for all 4 queues (line chart, alert on sustained growth)
+- Worker replica count vs. queue depth (correlation overlay)
+- Send latency: p50/p95/p99 of Resend API call duration
+- Error rates: failed sends, webhook processing errors, analytics flush failures
+- Campaign progress: total_recipients vs. queued vs. sent vs. failed (per running campaign)
+
+---
+
+## Deployment
+
+### Local Development
+
+```bash
+# Start all services
+docker-compose up --build
+
+# Services available:
+#   API:       http://localhost:8083  (mapped from container :8080)
+#   Postgres:  localhost:5435
+#   Redis:     localhost:6380
+
+# Run integration tests
+./scripts/test.sh
+```
+
+`docker-compose.yml` runs 5 containers:
+
+| Container | Image | Replicas | Notes |
+|---|---|---|---|
+| `api` | `Dockerfile.api` | 1 | Port 8083:8080 |
+| `worker-transactional` | `Dockerfile.worker` | 1 | Consumes both queues (goroutines) |
+| `worker-promotional` | `Dockerfile.worker` | 2 | `deploy.replicas: 2` |
+| `worker-campaign` | `Dockerfile.campaign` | 1 | Shared `/uploads` volume with API |
+| `postgres` | `postgres:16-alpine` | 1 | Schema auto-loaded from `db/schema.sql` |
+| `redis` | `redis:7-alpine` | 1 | -- |
+
+Webhook Service and Analytics Worker are omitted from docker-compose for local
+development (they require Resend callbacks). Add them for integration testing.
+
+### GKE Production
+
+```
+k8s/
+  namespace.yaml          # email-marketing namespace
+  configmap.yaml          # DATABASE_URL, REDIS_URL, DRY_RUN
+  secret.yaml             # RESEND_API_KEY, RESEND_WEBHOOK_SECRET (from GCP Secret Manager)
+  redis.yaml              # StatefulSet + Service (5Gi PVC, liveness/readiness probes)
+  deployments/            # Deployment + HPA per service (one YAML each)
+  prometheus/             # redis-exporter, prometheus-adapter, ServiceMonitor
+```
+
+**Production path for managed services:**
+
+- Redis: GCP Memorystore (Redis 7.x) instead of self-managed StatefulSet
+- PostgreSQL: Cloud SQL for PostgreSQL with automated backups, HA
+- Secrets: GCP Secret Manager with External Secrets Operator syncing to k8s Secrets
+
+### Dry-Run Load Testing
+
+```bash
+# Set DRY_RUN=true in ConfigMap or env var
+export DRY_RUN=true
+
+# Generate a large campaign file
+seq 1 1000000 | sed 's/^/user-/' > /uploads/load-test-1m.txt
+
+# Create the campaign
+curl -X POST http://localhost:8083/campaigns \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "00000000-0000-0000-0000-000000000002",
+    "template_type": "PROMO_OFFER",
+    "template_attributes": {"offer": "Load test"},
+    "file_path": "/uploads/load-test-1m.txt"
+  }'
+
+# Monitor queue depths
+watch -n1 'redis-cli -p 6380 LLEN queue:promotional'
+
+# All emails will be "sent" instantly (no Resend API calls).
+# DB writes, queue throughput, and campaign metrics all exercise the real path.
+```
+
+Dry-run mode tests the full pipeline: API validation, Redis enqueue, worker
+dequeue, DB state transitions, campaign fan-out, and analytics aggregation --
+everything except the actual Resend HTTP call.
+
+---
+
+## Scale Analysis
+
+### 10K emails/day
+
+Everything is fine. Single replicas for all services. Redis memory usage
+negligible. PostgreSQL handles the load without indexes being stressed.
+`delivery_events` table stays small.
+
+### 100K emails/day
+
+HPA starts scaling promotional workers. Queue depths may spike during campaign
+fan-out but drain quickly with 2-3 worker replicas. No infrastructure changes
+needed.
+
+### 1M emails/day
+
+- ~12 emails/sec sustained, ~120/sec during bursts
+- Need Redis memory monitoring (queue backlog during bursts)
+- `delivery_events` table hits ~3M rows/month (3 events/email avg) -- add monthly partitioning
+- Campaign fan-out for 1M-user files takes ~15 minutes with batch size 1,000
+- Consider increasing fan-out batch size to 5,000-10,000
+
+### 10M emails/day
+
+- ~115 emails/sec sustained, ~1,150/sec peak
+- Need queue sharding: `queue:promotional:{0..N}` with workers round-robin
+- Template rendering becomes a hot path -- add Redis caching by `(template_type, locale, hash(attributes))`
+- PgBouncer required for connection pooling across 20+ worker pods
+- `delivery_events` at 30M rows/month -- partitioning mandatory, consider archival to BigQuery
+- Campaign files should be on GCS/S3, not shared volumes
+
+### 100M+ emails/day
+
+- ~1,150 emails/sec sustained, ~11,500/sec peak
+- Dedicated Redis Cluster (16+ shards) for queue throughput
+- PostgreSQL read replicas for `delivery-stats` and campaign status queries
+- CDN for tracking pixels (open/click tracking)
+- Multi-provider delivery: Resend for transactional, SES for bulk promotional (cost optimization)
+- Kafka replaces Redis queues: per-tenant partitioning, infinite replay, consumer groups
+- `delivery_events` moves to a columnar store (ClickHouse) -- keep only 7 days in PostgreSQL
+- Template rendering as a separate service with aggressive caching
+
+---
+
+## Key Design Decisions
+
+**Why separate queues instead of a priority queue?**
+Redis has no native priority queue. Two separate list keys + separate worker pools
+gives hard isolation. A promotional burst (10M marketing emails) cannot cause
+head-of-line blocking for a transactional login code. Workers are separate
+containers -- promotional replicas scale independently.
+
+**Why file-based campaigns instead of inline user IDs?**
+A `POST /campaigns` with 1M user IDs in the request body would be a ~20MB JSON
+payload. Instead, the marketing service uploads a file to a shared volume (or S3),
+and the campaign worker streams it line-by-line. Peak memory is one batch (1,000
+records), not the full file.
+
+**Why batch analytics instead of real-time?**
+The Analytics Worker batches up to 100 events or 5 seconds because the
+`campaign_metrics` table uses `INSERT ... ON CONFLICT DO UPDATE` -- each upsert
+takes a row-level lock. Batching reduces lock contention and write amplification.
+A single flush groups events by `(campaign_id, bucket)` so each upsert covers
+many events.
+
+**Why Resend instead of SendGrid?**
+The prototype originally used SendGrid. Resend offers a simpler API, webhook
+support via Svix, and a developer-friendly free tier for prototyping. The
+`ResendClient` abstraction makes swapping providers straightforward.
+
+**Why Redis lists instead of Kafka?**
+At the current scale (prototype to ~10M emails/day), Redis lists are simpler to
+operate, have sub-millisecond latency for BRPOP, and handle 100K+ ops/sec
+easily. The trade-off is no replay and no consumer groups -- at 100M+/day,
+Kafka becomes the right choice for its partitioning, offset tracking, and
+replay capabilities.
