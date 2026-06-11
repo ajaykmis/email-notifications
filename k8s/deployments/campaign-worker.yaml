@@ -1,0 +1,55 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: campaign-uploads
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: campaign-worker
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: campaign-worker
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: campaign-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: email-marketing
+      component: campaign-worker
+  template:
+    metadata:
+      labels:
+        app: email-marketing
+        component: campaign-worker
+    spec:
+      containers:
+        - name: campaign-worker
+          image: gcr.io/PROJECT_ID/email-notifications-campaign:latest
+          envFrom:
+            - configMapRef:
+                name: email-marketing-config
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: uploads
+              mountPath: /uploads
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: campaign-uploads

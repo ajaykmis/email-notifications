@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-transactional
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: worker-transactional
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: email-marketing
+      component: worker-transactional
+  template:
+    metadata:
+      labels:
+        app: email-marketing
+        component: worker-transactional
+    spec:
+      containers:
+        - name: worker-transactional
+          image: gcr.io/PROJECT_ID/email-notifications-worker:latest
+          env:
+            - name: QUEUE
+              value: "transactional"
+          envFrom:
+            - configMapRef:
+                name: email-marketing-config
+            - secretRef:
+                name: email-marketing-secrets
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"

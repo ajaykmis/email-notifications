@@ -1,0 +1,138 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-adapter-config
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: prometheus-adapter
+data:
+  config.yaml: |
+    rules:
+      # Expose redis queue depth as a custom metric for HPA
+      - seriesQuery: 'redis_list_length{list=~"queue:.*"}'
+        resources:
+          overrides:
+            namespace:
+              resource: namespace
+        name:
+          matches: "^redis_list_length$"
+          as: "redis_queue_depth_${1}"
+        metricsQuery: 'redis_list_length{list="queue:promotional"}'
+      - seriesQuery: 'redis_list_length{list="queue:promotional"}'
+        resources:
+          overrides:
+            namespace:
+              resource: namespace
+        name:
+          as: "redis_queue_depth_promotional"
+        metricsQuery: 'redis_list_length{list="queue:promotional"}'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-adapter
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: prometheus-adapter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: email-marketing
+      component: prometheus-adapter
+  template:
+    metadata:
+      labels:
+        app: email-marketing
+        component: prometheus-adapter
+    spec:
+      serviceAccountName: prometheus-adapter
+      containers:
+        - name: prometheus-adapter
+          image: directxman12/k8s-prometheus-adapter:v0.11.2
+          args:
+            - "--prometheus-url=http://prometheus:9090"
+            - "--metrics-relist-interval=30s"
+            - "--config=/etc/adapter/config.yaml"
+          ports:
+            - containerPort: 6443
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: adapter-config
+              mountPath: /etc/adapter
+              readOnly: true
+      volumes:
+        - name: adapter-config
+          configMap:
+            name: prometheus-adapter-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-adapter
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: prometheus-adapter
+spec:
+  type: ClusterIP
+  ports:
+    - port: 443
+      targetPort: 6443
+      protocol: TCP
+  selector:
+    app: email-marketing
+    component: prometheus-adapter
+---
+# ServiceAccount for prometheus-adapter (needs access to custom metrics API)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus-adapter
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: prometheus-adapter
+---
+# ClusterRole for prometheus-adapter to serve custom metrics
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: email-marketing-prometheus-adapter
+  labels:
+    app: email-marketing
+    component: prometheus-adapter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-adapter
+    namespace: email-marketing
+---
+# Register the custom metrics API
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.custom.metrics.k8s.io
+  labels:
+    app: email-marketing
+    component: prometheus-adapter
+spec:
+  service:
+    name: prometheus-adapter
+    namespace: email-marketing
+  group: custom.metrics.k8s.io
+  version: v1beta1
+  insecureSkipTLSVerify: true
+  groupPriorityMinimum: 100
+  versionPriority: 100

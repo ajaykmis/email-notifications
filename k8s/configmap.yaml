@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: email-marketing-config
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+data:
+  DATABASE_URL: "postgres://postgres:postgres@postgres:5432/emaildb?sslmode=disable"
+  REDIS_URL: "redis://redis:6379"
+  DRY_RUN: "false"

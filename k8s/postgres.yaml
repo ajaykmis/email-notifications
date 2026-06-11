@@ -1,0 +1,205 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-schema
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: postgres
+data:
+  schema.sql: |
+    -- Tenants (multi-tenant support)
+    CREATE TABLE IF NOT EXISTS tenants (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name        TEXT NOT NULL UNIQUE,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    -- Messages (reusable template content keyed by type)
+    CREATE TABLE IF NOT EXISTS messages (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        template_type   TEXT NOT NULL,
+        locale          TEXT NOT NULL DEFAULT 'en',
+        content         TEXT NOT NULL,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (template_type, locale)
+    );
+
+    -- Email jobs
+    CREATE TABLE IF NOT EXISTS emails (
+        id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id           UUID NOT NULL REFERENCES tenants(id),
+        recipient_user_id   TEXT NOT NULL,
+        recipient_address   TEXT NOT NULL,
+        category            TEXT NOT NULL CHECK (category IN ('TRANSACTIONAL','PROMOTIONAL')),
+        template_type       TEXT NOT NULL,
+        template_attributes JSONB NOT NULL DEFAULT '{}',
+        locale              TEXT NOT NULL DEFAULT 'en',
+        status              TEXT NOT NULL DEFAULT 'PENDING'
+                                CHECK (status IN ('PENDING','QUEUED','SENT','FAILED')),
+        scheduled_at        TIMESTAMPTZ,
+        sent_at             TIMESTAMPTZ,
+        failure_reason      TEXT,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_emails_status    ON emails(status);
+    CREATE INDEX IF NOT EXISTS idx_emails_tenant    ON emails(tenant_id);
+    CREATE INDEX IF NOT EXISTS idx_emails_scheduled ON emails(scheduled_at) WHERE scheduled_at IS NOT NULL;
+
+    -- Delivery events (for tracking delivery rate)
+    CREATE TABLE IF NOT EXISTS delivery_events (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        email_id    UUID NOT NULL REFERENCES emails(id),
+        event_type  TEXT NOT NULL,
+        occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        metadata    JSONB NOT NULL DEFAULT '{}'
+    );
+
+    -- Campaigns (bulk promotional sends)
+    CREATE TABLE IF NOT EXISTS campaigns (
+        id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id           UUID NOT NULL REFERENCES tenants(id),
+        template_type       TEXT NOT NULL,
+        template_attributes JSONB NOT NULL DEFAULT '{}',
+        locale              TEXT NOT NULL DEFAULT 'en',
+        status              TEXT NOT NULL DEFAULT 'PENDING'
+                                CHECK (status IN ('PENDING','RUNNING','DONE','FAILED')),
+        total_recipients    INT NOT NULL DEFAULT 0,
+        queued_count        INT NOT NULL DEFAULT 0,
+        sent_count          INT NOT NULL DEFAULT 0,
+        failed_count        INT NOT NULL DEFAULT 0,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        file_path           TEXT NOT NULL DEFAULT '',
+        scheduled_at        TIMESTAMPTZ,
+        completed_at        TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_campaigns_scheduled ON campaigns(scheduled_at) WHERE scheduled_at IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_campaigns_tenant ON campaigns(tenant_id);
+
+    -- Link emails back to the campaign that created them
+    ALTER TABLE emails ADD COLUMN IF NOT EXISTS campaign_id UUID REFERENCES campaigns(id);
+    CREATE INDEX IF NOT EXISTS idx_emails_campaign ON emails(campaign_id) WHERE campaign_id IS NOT NULL;
+
+    -- Track Resend message ID on each email
+    ALTER TABLE emails ADD COLUMN IF NOT EXISTS resend_id TEXT;
+    CREATE INDEX IF NOT EXISTS idx_emails_resend_id ON emails(resend_id);
+
+    -- Per-campaign time-bucketed metrics
+    CREATE TABLE IF NOT EXISTS campaign_metrics (
+        campaign_id  UUID NOT NULL REFERENCES campaigns(id),
+        bucket       TIMESTAMPTZ NOT NULL,
+        sent         INT NOT NULL DEFAULT 0,
+        delivered    INT NOT NULL DEFAULT 0,
+        opened       INT NOT NULL DEFAULT 0,
+        clicked      INT NOT NULL DEFAULT 0,
+        bounced      INT NOT NULL DEFAULT 0,
+        unsubscribed INT NOT NULL DEFAULT 0,
+        failed       INT NOT NULL DEFAULT 0,
+        PRIMARY KEY (campaign_id, bucket)
+    );
+    CREATE INDEX IF NOT EXISTS idx_campaign_metrics_bucket ON campaign_metrics(bucket);
+
+    -- Global unsubscribe list (per-tenant)
+    CREATE TABLE IF NOT EXISTS unsubscribes (
+        id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        email      TEXT NOT NULL,
+        tenant_id  UUID NOT NULL REFERENCES tenants(id),
+        reason     TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (email, tenant_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_unsub_email ON unsubscribes(email);
+
+    -- Seed default tenants
+    INSERT INTO tenants (id, name) VALUES
+        ('00000000-0000-0000-0000-000000000001', 'booking-service'),
+        ('00000000-0000-0000-0000-000000000002', 'marketing-service'),
+        ('00000000-0000-0000-0000-000000000003', 'friending-service')
+    ON CONFLICT DO NOTHING;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: postgres
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+      protocol: TCP
+  selector:
+    app: email-marketing
+    component: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: email-marketing
+      component: postgres
+  template:
+    metadata:
+      labels:
+        app: email-marketing
+        component: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              value: "postgres"
+            - name: POSTGRES_DB
+              value: "emaildb"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: init-schema
+              mountPath: /docker-entrypoint-initdb.d
+      volumes:
+        - name: init-schema
+          configMap:
+            name: postgres-init-schema
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

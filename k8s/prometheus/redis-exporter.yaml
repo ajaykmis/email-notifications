@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-exporter
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: redis-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: email-marketing
+      component: redis-exporter
+  template:
+    metadata:
+      labels:
+        app: email-marketing
+        component: redis-exporter
+    spec:
+      containers:
+        - name: redis-exporter
+          image: oliver006/redis_exporter:v1.62.0
+          env:
+            - name: REDIS_ADDR
+              value: "redis://redis:6379"
+          ports:
+            - containerPort: 9121
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 9121
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 9121
+            initialDelaySeconds: 10
+            periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-exporter
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: redis-exporter
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9121
+      targetPort: 9121
+      protocol: TCP
+  selector:
+    app: email-marketing
+    component: redis-exporter
