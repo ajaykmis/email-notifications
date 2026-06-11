@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -38,19 +42,66 @@ const (
 	queuePromotional   = "queue:promotional"
 )
 
-// ── SendGrid mock ─────────────────────────────────────────────────────────────
-// Replace with actual SendGrid SDK call in production.
+// ── Resend client ─────────────────────────────────────────────────────────────
 
-type SendGridClient struct {
+type ResendClient struct {
 	APIKey string
+	DryRun bool
+	http   *http.Client
 }
 
-func (s *SendGridClient) Send(job EmailJob, body string) error {
-	// Simulate occasional failure (1-in-10) for realism
-	// In production: POST to api.sendgrid.com/v3/mail/send
-	log.Printf("[sendgrid] TO=%s TEMPLATE=%s LOCALE=%s BODY=%q",
-		job.RecipientAddress, job.TemplateType, job.Locale, body)
-	return nil
+func (r *ResendClient) Send(job EmailJob, body string) (string, error) {
+	if r.DryRun {
+		return "dry-run-" + job.EmailID, nil
+	}
+
+	subject := "Notification"
+	switch job.TemplateType {
+	case "LOGIN_MSG":
+		subject = "Your login code"
+	case "WELCOME":
+		subject = "Welcome!"
+	case "PROMO_OFFER":
+		subject = "Special offer"
+	case "ORDER_CONFIRM":
+		subject = "Order confirmation"
+	}
+
+	reqBody, _ := json.Marshal(map[string]any{
+		"from":    "noreply@mercor.com",
+		"to":      []string{job.RecipientAddress},
+		"subject": subject,
+		"html":    body,
+	})
+
+	req, err := http.NewRequest("POST", "https://api.resend.com/emails", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+r.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := r.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("resend request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("resend returned %d: %s", resp.StatusCode, string(respBytes))
+	}
+
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(respBytes, &result); err != nil {
+		return "", fmt.Errorf("parse response: %w", err)
+	}
+	return result.ID, nil
 }
 
 // ── Template rendering ────────────────────────────────────────────────────────
@@ -79,7 +130,7 @@ func renderTemplate(job EmailJob) string {
 
 // processQueue blocks on BRPOP from the given queue and processes one job.
 // Returns false when context is cancelled.
-func processQueue(ctx context.Context, sg *SendGridClient, queue string) {
+func processQueue(ctx context.Context, resend *ResendClient, queue string) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -108,28 +159,50 @@ func processQueue(ctx context.Context, sg *SendGridClient, queue string) {
 			continue
 		}
 
-		processJob(ctx, sg, job)
+		processJob(ctx, resend, job)
 	}
 }
 
-func processJob(ctx context.Context, sg *SendGridClient, job EmailJob) {
+func processJob(ctx context.Context, resend *ResendClient, job EmailJob) {
 	log.Printf("[worker] processing email_id=%s category=%s template=%s",
 		job.EmailID, job.Category, job.TemplateType)
 
+	// Check unsubscribe list before sending
+	var exists int
+	err := db.QueryRowContext(ctx,
+		`SELECT 1 FROM unsubscribes WHERE email = $1 LIMIT 1`,
+		job.RecipientAddress).Scan(&exists)
+	if err == nil {
+		// recipient is unsubscribed — skip send
+		markFailed(ctx, job.EmailID, "recipient unsubscribed")
+		logDeliveryEvent(ctx, job.EmailID, "FAILED", map[string]any{"reason": "unsubscribed"})
+		log.Printf("[worker] skipped email_id=%s — recipient %s is unsubscribed",
+			job.EmailID, job.RecipientAddress)
+		return
+	}
+
 	body := renderTemplate(job)
 
-	if err := sg.Send(job, body); err != nil {
-		log.Printf("[worker] sendgrid error for %s: %v", job.EmailID, err)
+	resendID, err := resend.Send(job, body)
+	if err != nil {
+		log.Printf("[worker] resend error for %s: %v", job.EmailID, err)
 		markFailed(ctx, job.EmailID, err.Error())
 		logDeliveryEvent(ctx, job.EmailID, "FAILED", map[string]any{"error": err.Error()})
 		return
 	}
 
-	markSent(ctx, job.EmailID)
+	markSent(ctx, job.EmailID, resendID)
 	logDeliveryEvent(ctx, job.EmailID, "SENT", map[string]any{
 		"recipient": job.RecipientAddress,
+		"resend_id": resendID,
 	})
-	log.Printf("[worker] sent email_id=%s to=%s", job.EmailID, job.RecipientAddress)
+	if resend.DryRun {
+		log.Printf("[worker] dry-run email_id=%s to=%s resend_id=%s",
+			job.EmailID, job.RecipientAddress, resendID)
+	} else {
+		log.Printf("[worker] sent email_id=%s to=%s resend_id=%s",
+			job.EmailID, job.RecipientAddress, resendID)
+	}
 }
 
 // ── Scheduled email sweeper ───────────────────────────────────────────────────
@@ -192,9 +265,10 @@ func sweepScheduled(ctx context.Context) {
 
 // ── DB helpers ────────────────────────────────────────────────────────────────
 
-func markSent(ctx context.Context, emailID string) {
+func markSent(ctx context.Context, emailID, resendID string) {
 	db.ExecContext(ctx,
-		`UPDATE emails SET status='SENT', sent_at=NOW() WHERE id=$1`, emailID)
+		`UPDATE emails SET status='SENT', sent_at=NOW(), resend_id=$1 WHERE id=$2`,
+		resendID, emailID)
 }
 
 func markFailed(ctx context.Context, emailID, reason string) {
@@ -221,7 +295,8 @@ func main() {
 	if redisURL == "" {
 		redisURL = "redis://localhost:6379"
 	}
-	sgAPIKey := os.Getenv("SENDGRID_API_KEY")
+	resendAPIKey := os.Getenv("RESEND_API_KEY")
+	dryRun, _ := strconv.ParseBool(os.Getenv("DRY_RUN"))
 
 	var err error
 	db, err = sql.Open("postgres", dbURL)
@@ -248,7 +323,11 @@ func main() {
 		log.Fatalf("redis ping: %v", err)
 	}
 
-	sg := &SendGridClient{APIKey: sgAPIKey}
+	resend := &ResendClient{
+		APIKey: resendAPIKey,
+		DryRun: dryRun,
+		http:   &http.Client{Timeout: 10 * time.Second},
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -257,8 +336,8 @@ func main() {
 	// so promotional volume never blocks transactional delivery.
 	log.Println("Worker started — transactional + promotional consumers running")
 
-	go processQueue(ctx, sg, queueTransactional) // high-priority
-	go processQueue(ctx, sg, queuePromotional)   // lower-priority, isolated
+	go processQueue(ctx, resend, queueTransactional) // high-priority
+	go processQueue(ctx, resend, queuePromotional)   // lower-priority, isolated
 	go runScheduler(ctx)                          // scheduled email sweeper
 
 	<-ctx.Done()

@@ -78,3 +78,35 @@ INSERT INTO tenants (id, name) VALUES
     ('00000000-0000-0000-0000-000000000002', 'marketing-service'),
     ('00000000-0000-0000-0000-000000000003', 'friending-service')
 ON CONFLICT DO NOTHING;
+
+-- ── Schema additions: resend_id, campaign_metrics, unsubscribes ──────────────
+
+-- Track Resend message ID on each email
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS resend_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_emails_resend_id ON emails(resend_id);
+
+-- Per-campaign time-bucketed metrics
+CREATE TABLE IF NOT EXISTS campaign_metrics (
+    campaign_id  UUID NOT NULL REFERENCES campaigns(id),
+    bucket       TIMESTAMPTZ NOT NULL,
+    sent         INT NOT NULL DEFAULT 0,
+    delivered    INT NOT NULL DEFAULT 0,
+    opened       INT NOT NULL DEFAULT 0,
+    clicked      INT NOT NULL DEFAULT 0,
+    bounced      INT NOT NULL DEFAULT 0,
+    unsubscribed INT NOT NULL DEFAULT 0,
+    failed       INT NOT NULL DEFAULT 0,
+    PRIMARY KEY (campaign_id, bucket)
+);
+CREATE INDEX IF NOT EXISTS idx_campaign_metrics_bucket ON campaign_metrics(bucket);
+
+-- Global unsubscribe list (per-tenant)
+CREATE TABLE IF NOT EXISTS unsubscribes (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email      TEXT NOT NULL,
+    tenant_id  UUID NOT NULL REFERENCES tenants(id),
+    reason     TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (email, tenant_id)
+);
+CREATE INDEX IF NOT EXISTS idx_unsub_email ON unsubscribes(email);
