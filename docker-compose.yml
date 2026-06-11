@@ -136,6 +136,7 @@ services:
     image: oliver006/redis_exporter:v1.62.0
     environment:
       REDIS_ADDR: redis://redis:6379
+      REDIS_EXPORTER_CHECK_KEYS: queue:transactional,queue:promotional,queue:campaigns,queue:analytics
     ports:
       - "9121:9121"
     depends_on:

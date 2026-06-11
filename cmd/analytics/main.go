@@ -278,6 +278,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("db open: %v", err)
 	}
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(25)
+	db.SetConnMaxLifetime(5 * time.Minute)
 	for i := 0; i < 10; i++ {
 		if err = db.Ping(); err == nil {
 			break

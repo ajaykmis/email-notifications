@@ -24,6 +24,8 @@ spec:
           env:
             - name: REDIS_ADDR
               value: "redis://redis:6379"
+            - name: REDIS_EXPORTER_CHECK_KEYS
+              value: "queue:transactional,queue:promotional,queue:campaigns,queue:analytics"
           ports:
             - containerPort: 9121
           resources:

@@ -2,12 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -95,8 +100,14 @@ func handleResendWebhook(w http.ResponseWriter, r *http.Request) {
 		webhookDuration.Observe(time.Since(start).Seconds())
 	}()
 
-	// Simplified signature verification for MVP:
-	// If RESEND_WEBHOOK_SECRET is set, require svix-signature header presence.
+	// Read body for signature verification and parsing
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "failed to read body", http.StatusBadRequest)
+		return
+	}
+
+	// HMAC-SHA256 signature verification
 	webhookSecret := os.Getenv("RESEND_WEBHOOK_SECRET")
 	if webhookSecret != "" {
 		sig := r.Header.Get("svix-signature")
@@ -105,12 +116,30 @@ func handleResendWebhook(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "missing signature", http.StatusUnauthorized)
 			return
 		}
-		// NOTE: Full Svix HMAC verification would go here.
-		// For MVP we only check header presence.
+		msgID := r.Header.Get("svix-id")
+		timestamp := r.Header.Get("svix-timestamp")
+		signedContent := msgID + "." + timestamp + "." + string(bodyBytes)
+		mac := hmac.New(sha256.New, []byte(webhookSecret))
+		mac.Write([]byte(signedContent))
+		expectedSig := hex.EncodeToString(mac.Sum(nil))
+
+		// svix-signature is "v1,<base64sig>" — check each comma-separated entry
+		valid := false
+		for _, part := range strings.Split(sig, " ") {
+			if strings.TrimPrefix(part, "v1,") == expectedSig {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			webhookVerifyFailed.Inc()
+			http.Error(w, "invalid signature", http.StatusUnauthorized)
+			return
+		}
 	}
 
 	var event ResendWebhookEvent
-	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+	if err := json.Unmarshal(bodyBytes, &event); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
@@ -131,7 +160,7 @@ func handleResendWebhook(w http.ResponseWriter, r *http.Request) {
 	var emailID string
 	var campaignID sql.NullString
 	var tenantID string
-	err := db.QueryRowContext(ctx,
+	err = db.QueryRowContext(ctx,
 		`SELECT id, campaign_id, tenant_id FROM emails WHERE resend_id = $1`,
 		event.Data.EmailID,
 	).Scan(&emailID, &campaignID, &tenantID)
@@ -217,6 +246,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("db open: %v", err)
 	}
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(25)
+	db.SetConnMaxLifetime(5 * time.Minute)
 	for i := 0; i < 10; i++ {
 		if err = db.Ping(); err == nil {
 			break

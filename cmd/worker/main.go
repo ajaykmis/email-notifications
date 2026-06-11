@@ -193,11 +193,11 @@ func processJob(ctx context.Context, resend *ResendClient, job EmailJob) {
 	log.Printf("[worker] processing email_id=%s category=%s template=%s",
 		job.EmailID, job.Category, job.TemplateType)
 
-	// Check unsubscribe list before sending
+	// Check unsubscribe list before sending (tenant-scoped)
 	var exists int
 	err := db.QueryRowContext(ctx,
-		`SELECT 1 FROM unsubscribes WHERE email = $1 LIMIT 1`,
-		job.RecipientAddress).Scan(&exists)
+		`SELECT 1 FROM unsubscribes WHERE email = $1 AND tenant_id = $2 LIMIT 1`,
+		job.RecipientAddress, job.TenantID).Scan(&exists)
 	if err == nil {
 		// recipient is unsubscribed — skip send
 		markFailed(ctx, job.EmailID, "recipient unsubscribed")
