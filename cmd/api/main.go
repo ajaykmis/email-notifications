@@ -509,6 +509,10 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
 	mux.HandleFunc("POST /send-email", handleSendEmail)
 	mux.HandleFunc("POST /schedule-email", handleScheduleEmail)
 	mux.HandleFunc("GET /delivery-stats", handleDeliveryStats)
