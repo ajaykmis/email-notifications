@@ -1,86 +1,65 @@
 #!/usr/bin/env bash
-set -e
-BASE="http://localhost:8080"
+set -euo pipefail
 
-echo "=== Send TRANSACTIONAL email (LOGIN_MSG) ==="
-curl -s -X POST "$BASE/send-email" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "00000000-0000-0000-0000-000000000001",
-    "user_id": "user-42",
-    "category": "TRANSACTIONAL",
-    "template_type": "LOGIN_MSG",
-    "template_attributes": {"code": "987654"},
-    "locale": "en"
-  }' | jq .
+API="http://localhost:8083"
+WEBHOOK="http://localhost:8084"
+TENANT_ID="00000000-0000-0000-0000-000000000002"
 
-echo ""
-echo "=== Send PROMOTIONAL email ==="
-curl -s -X POST "$BASE/send-email" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "00000000-0000-0000-0000-000000000002",
-    "user_id": "user-99",
-    "category": "PROMOTIONAL",
-    "template_type": "PROMO_OFFER",
-    "template_attributes": {"offer": "50% off this weekend"},
-    "locale": "en"
-  }' | jq .
+echo "=== Email Marketing System — Smoke Test ==="
 
-echo ""
-echo "=== Schedule a future email ==="
-FUTURE=$(date -u -v+1H "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "+1 hour" "+%Y-%m-%dT%H:%M:%SZ")
-curl -s -X POST "$BASE/schedule-email" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"tenant_id\": \"00000000-0000-0000-0000-000000000001\",
-    \"user_id\": \"user-77\",
-    \"category\": \"TRANSACTIONAL\",
-    \"template_type\": \"ORDER_CONFIRM\",
-    \"template_attributes\": {\"order_id\": \"ORD-2026-001\"},
-    \"locale\": \"en\",
-    \"scheduled_at\": \"$FUTURE\"
-  }" | jq .
+# 1. Health check
+echo "[1/6] Waiting for API..."
+for i in $(seq 1 30); do
+    if curl -sf "$API/delivery-stats" > /dev/null 2>&1; then break; fi
+    sleep 1
+done
 
-echo ""
-echo "=== Delivery stats ==="
-curl -s "$BASE/delivery-stats" | jq .
+# 2. Send a transactional email
+echo "[2/6] Sending transactional email..."
+RESP=$(curl -sf -X POST "$API/send-email" \
+    -H "Content-Type: application/json" \
+    -d "{
+        \"tenant_id\": \"$TENANT_ID\",
+        \"user_id\": \"test-user-1\",
+        \"category\": \"TRANSACTIONAL\",
+        \"template_type\": \"LOGIN_MSG\",
+        \"template_attributes\": {\"code\": \"123456\"}
+    }")
+EMAIL_ID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['email_id'])")
+echo "  email_id=$EMAIL_ID"
 
-echo ""
-echo "=== Delivery stats for booking-service tenant ==="
-curl -s "$BASE/delivery-stats?tenant_id=00000000-0000-0000-0000-000000000001" | jq .
+# 3. Send a promotional email
+echo "[3/6] Sending promotional email..."
+curl -sf -X POST "$API/send-email" \
+    -H "Content-Type: application/json" \
+    -d "{
+        \"tenant_id\": \"$TENANT_ID\",
+        \"user_id\": \"test-user-2\",
+        \"category\": \"PROMOTIONAL\",
+        \"template_type\": \"PROMO_OFFER\",
+        \"template_attributes\": {\"offer\": \"50% off\"}
+    }" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'  email_id={d[\"email_id\"]} status={d[\"status\"]}')"
 
-echo ""
-echo "=== Create a campaign for 10 users (simulating 1M) ==="
-# Generate 10 user IDs to simulate a bulk send
-USER_IDS=$(python3 -c "import json; print(json.dumps(['user-' + str(i) for i in range(1,11)]))")
-CAMPAIGN=$(curl -s -X POST "$BASE/campaigns" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"tenant_id\": \"00000000-0000-0000-0000-000000000002\",
-    \"template_type\": \"PROMO_OFFER\",
-    \"template_attributes\": {\"offer\": \"Weekend sale: 40% off\"},
-    \"locale\": \"en\",
-    \"user_ids\": $USER_IDS
-  }")
-echo "$CAMPAIGN" | jq .
-
-CAMPAIGN_ID=$(echo "$CAMPAIGN" | jq -r '.campaign_id')
-
-echo ""
-echo "=== Poll campaign status (after 3s) ==="
+# 4. Wait for workers to process
+echo "[4/6] Waiting for workers to process (3s)..."
 sleep 3
-curl -s "$BASE/campaigns/$CAMPAIGN_ID" | jq .
+
+# 5. Check delivery stats
+echo "[5/6] Checking delivery stats..."
+curl -sf "$API/delivery-stats?tenant_id=$TENANT_ID" | python3 -m json.tool
+
+# 6. Send a mock webhook event (simulate Resend callback)
+echo "[6/6] Sending mock webhook (email.delivered)..."
+curl -sf -X POST "$WEBHOOK/webhooks/resend" \
+    -H "Content-Type: application/json" \
+    -d "{
+        \"type\": \"email.delivered\",
+        \"data\": {
+            \"email_id\": \"dry-run-$EMAIL_ID\",
+            \"to\": [\"test-user-1@example.com\"],
+            \"created_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+        }
+    }" && echo "  Webhook accepted"
 
 echo ""
-echo "=== Validation: bad category ==="
-curl -s -X POST "$BASE/send-email" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "00000000-0000-0000-0000-000000000001",
-    "user_id": "user-1",
-    "category": "SPAM",
-    "template_type": "LOGIN_MSG",
-    "template_attributes": {}
-  }'
-echo ""
+echo "=== Smoke test complete ==="

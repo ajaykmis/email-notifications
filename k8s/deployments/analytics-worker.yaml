@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-worker
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: analytics-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: email-marketing
+      component: analytics-worker
+  template:
+    metadata:
+      labels:
+        app: email-marketing
+        component: analytics-worker
+    spec:
+      containers:
+        - name: analytics-worker
+          image: gcr.io/PROJECT_ID/email-notifications-analytics:latest
+          envFrom:
+            - configMapRef:
+                name: email-marketing-config
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"

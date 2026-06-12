@@ -1,0 +1,6 @@
+# Binaries (root level only)
+/api
+/worker
+/campaign
+/webhook
+/analytics

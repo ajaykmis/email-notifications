@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-promotional
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: worker-promotional
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: email-marketing
+      component: worker-promotional
+  template:
+    metadata:
+      labels:
+        app: email-marketing
+        component: worker-promotional
+    spec:
+      containers:
+        - name: worker-promotional
+          image: gcr.io/PROJECT_ID/email-notifications-worker:latest
+          env:
+            - name: QUEUE
+              value: "promotional"
+          envFrom:
+            - configMapRef:
+                name: email-marketing-config
+            - secretRef:
+                name: email-marketing-secrets
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker-promotional-hpa
+  namespace: email-marketing
+  labels:
+    app: email-marketing
+    component: worker-promotional
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker-promotional
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Object
+      object:
+        describedObject:
+          apiVersion: v1
+          kind: Service
+          name: redis
+        metric:
+          name: redis_queue_depth_promotional
+        target:
+          type: Value
+          value: "1000"
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300

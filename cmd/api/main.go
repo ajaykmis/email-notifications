@@ -11,8 +11,28 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 )
+
+// ── Prometheus metrics ───────────────────────────────────────────────────────
+
+var (
+	emailSendTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "email_send_total",
+		Help: "Total emails submitted to API",
+	}, []string{"category", "status"})
+
+	emailQueueDepth = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "email_queue_depth",
+		Help: "Current depth of Redis queues",
+	}, []string{"queue"})
+)
+
+func init() {
+	prometheus.MustRegister(emailSendTotal, emailQueueDepth)
+}
 
 // ── DB + Redis globals ────────────────────────────────────────────────────────
 
@@ -173,6 +193,7 @@ func handleSendEmail(w http.ResponseWriter, r *http.Request) {
 	// 4. Mark QUEUED
 	db.ExecContext(ctx, `UPDATE emails SET status='QUEUED' WHERE id=$1`, emailID)
 	logDeliveryEvent(ctx, emailID, "QUEUED", nil)
+	emailSendTotal.WithLabelValues(req.Category, "queued").Inc()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -226,6 +247,8 @@ func handleScheduleEmail(w http.ResponseWriter, r *http.Request) {
 	// Scheduled emails are picked up by a separate cron/scheduler process.
 	// For this prototype we just store them; a scheduler loop would enqueue
 	// them when scheduled_at <= NOW().
+
+	emailSendTotal.WithLabelValues(req.Category, "scheduled").Inc()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -466,7 +489,30 @@ func main() {
 		log.Fatalf("redis ping: %v", err)
 	}
 
+	// Prometheus queue-depth poller
+	go func() {
+		for {
+			for _, q := range []string{"queue:transactional", "queue:promotional", "queue:campaigns", "queue:analytics"} {
+				depth, _ := rdb.LLen(context.Background(), q).Result()
+				emailQueueDepth.WithLabelValues(q).Set(float64(depth))
+			}
+			time.Sleep(15 * time.Second)
+		}
+	}()
+
+	// Prometheus metrics server
+	go func() {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", promhttp.Handler())
+		log.Println("Metrics server on :9091")
+		http.ListenAndServe(":9091", metricsMux)
+	}()
+
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
 	mux.HandleFunc("POST /send-email", handleSendEmail)
 	mux.HandleFunc("POST /schedule-email", handleScheduleEmail)
 	mux.HandleFunc("GET /delivery-stats", handleDeliveryStats)
